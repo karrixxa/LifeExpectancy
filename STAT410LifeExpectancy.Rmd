@@ -1,0 +1,431 @@
+---
+title: "life_y"
+output: html_document
+date: "2025-04-13"
+---
+
+This document presents an analysis of global life expectancy data. Our goals are to:  
+- **Explore & Clean the Data:** Identify issues such as missing values, outliers, and discrepancies (e.g., population inconsistencies).  
+- **Develop Predictive Models:** Build multiple linear regression models and assess the contribution of health, economic, and social indicators.  
+- **Evaluate & Diagnose:** Compare model performance, conduct diagnostic tests, and further refine the model using regularization techniques (Ridge and Lasso).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Function to set plot dimensions when needed
+set_plot_dimensions <- function(width_choice, height_choice) {
+  options(repr.plot.width = width_choice, repr.plot.height = height_choice)
+}
+
+# Loading Consolidated Package  
+packages <- c("ggplot2", "dplyr", "gridExtra", "ggcorrplot", "car", "e1071","MASS", "lmtest", "Metrics", "GGally", "glmnet", "sandwich", "caret")
+invisible(lapply(packages, library, character.only = TRUE))
+
+#Set a global seed
+set.seed(2025)
+```
+
+1. LOADING DATA
+```{r}
+#Read the CSV file
+life <- read.csv("/Users/charisxiong/Downloads/LifeExpectancy.csv")
+
+#Note: All features are continuous except for Country, Status which are categorical
+# str(life)
+# names(life)
+
+#Subset to use later (for additional analyses (like Population Discrepancy in #3))
+life_details <- life %>% dplyr::select(Country, Year, Population)
+#Removing Unneccessary Variables (we don't need for main analysis)
+data <- subset(life, select = -c(Country, Year))
+```
+
+2. EXPLORING MISSING DATA 
+```{r}
+# Calculate missing rows and overall missing data count
+missing.rows = dim(data)[1] -  dim(na.omit(data))[1]
+sprintf("Dataset size: [%s]", toString(dim(data)))
+sprintf("Missing rows: %s (%s%%)", missing.rows, round((missing.rows*100)/dim(data)[1], 2))
+
+# Count missing values for each feature
+missing_counts <- data.frame(feature = factor(names(data)), counts=sapply(data, function(x) sum(is.na(x))))
+
+#Plot missing counts per feature
+set_plot_dimensions(16,8)
+ggplot(missing_counts,aes(x=reorder(feature, -counts), y=counts, fill=counts)) + geom_bar(stat="identity") + ggtitle("Missing Counts in Each Feature") +xlab("Feature") + ylab("Missing count") +theme(axis.text.x=element_text(angle=25, hjust=1))+theme(text = element_text(size = 12))+scale_fill_continuous(trans = 'reverse')
+
+#Findings: We have more than 40% of missing data ("Missing rows: 1289 (43.87%)"), so we can apply data imputation (high outliers and replace with median; low outliers and replace with mean) in section #5
+#Findings: Most of our missing values are from Population, Hepatitis B, GDP, Total_expenditure
+
+#Check summary of each variable
+variables <- setdiff(names(life), c("Country", "Year"))
+print(summary(data[variables]))
+```
+
+3. ADDRESSING POPULATION DISCREPENCY
+```{r}
+#We have findings that don't make sense ( Population has a country with just 34 people (and more reasons listed below))
+
+#Discrepancy between different years' population - not possible for that type of fluctuation (same for Algeria and Thailand, other countries)
+life_details %>% 
+  filter(Country == "Afghanistan")
+
+#Possible alternative: We can calculate the maximum population per country
+#However, it's not possible and doesn't seem logically correct (Israel, Sri Lanka, Iceland, their max recorded population is below 100,000, which is way too low compared to actual populations in 2015 (or earlier years))
+population_max <- life_details %>%
+  group_by(Country) %>%
+  summarise(max_population = max(Population, na.rm = TRUE)) %>%
+  filter(max_population < 100000)
+print(population_max)
+
+#Final Decision: We decided to drop Population because 1) highly skewed 2) lots of missing values 3) high discrepancies
+drop_vars <- c("Population")
+data <- data %>% dplyr::select(-all_of(drop_vars))
+
+```
+
+
+4. CHECKING FOR OUTLIERS FOR EACH FEATURE (VISUALLY)
+```{r}
+#Strategy: Data imputation, if we have high outliers then replace with median; low outliers then replace with mean)
+#Findings: Boxplots that show none/few outliers: Alcohol, BMI, Income.composition.of.resources, Schooling
+
+#Plot boxplots for each variable to detect outliers
+plot_list <- lapply(names(data), function(var) {
+  ggplot(data, aes_string(x = "1", y = var)) +
+    geom_boxplot(fill = "lightblue", outlier.colour = "lightblue", width = 0.3) +labs(title = paste("Boxplot of", var), x = "", y = var) +theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),plot.title = element_text(size = 10),axis.title = element_text(size = 8),axis.text = element_text(size = 7))})
+
+# Arrange the plots into pages with 2 rows x 3 columns per page
+multi_page_plots <- marrangeGrob(plot_list, nrow = 2, ncol = 3, top = "Boxplots of Variables")
+print(multi_page_plots)
+```
+
+
+5. IMPUTATION
+```{r}
+# Define variables for imputation:
+median_impute <- c(
+  "Life.expectancy", "Adult.Mortality", "Hepatitis.B", "Polio",
+  "Diphtheria", "Total.expenditure", "GDP",
+  "thinness..1.19.years", "thinness.5.9.years", "HIV.AIDS",
+  "percentage.expenditure", "infant.deaths", "Measles", "under.five.deaths")
+mean_impute <- c("Alcohol", "BMI", "Income.composition.of.resources", "Schooling")
+
+# Apply median imputation for variables with high outliers
+data[median_impute] <- lapply(data[median_impute], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+# Apply mean imputation for variables with low outliers
+data[mean_impute] <- lapply(data[mean_impute], function(x) ifelse(is.na(x), mean(x, na.rm = TRUE), x))
+
+# Factor conversion for categorical variable
+data$Status <- as.factor(data$Status)
+# class(data$Status)
+
+#Make a copy of data, that is unscaled
+copy_data <- data
+```
+
+
+6. CHECKING CORRELATION, COLLINEARITY, VIF
+```{r}
+# Calculate Correlation Matrix
+set_plot_dimensions(16, 10)
+corr <- round(cor(subset(data, select = -c(Status)), use = "complete.obs"), 3)
+
+ggcorrplot(corr, type = "upper", lab = TRUE, outline.color = "black", lab_size = 1.5, legend.title = "Correlation") + ggtitle("Correlation Matrix") + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 6), axis.text.y = element_text(size = 6))
+
+# Check multicollinearity using VIF on a linear model
+mod <- lm(Life.expectancy ~ ., data = subset(data, select = -c(Status)))
+vifs <- vif(mod)
+print(vifs)
+
+# Plot VIF values with a reference line at VIF = 5
+vifs_df <- data.frame(Feature = names(vifs), VIF = vifs)
+set_plot_dimensions(16, 8)
+ggplot(vifs_df, aes(x = Feature, y = VIF, fill = VIF > 5)) + 
+  geom_bar(stat = "identity") +
+  scale_y_continuous(trans = "sqrt", breaks = c(5, 10, 50, 100)) +
+  geom_hline(yintercept = 5, colour = "red", linetype = "dashed", size = 1) + 
+  ggtitle("VIF per Feature") +
+  xlab("Features") +
+  ylab("VIF") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),       
+    axis.title.x = element_text(size = 12, face = "bold"),    
+    axis.title.y = element_text(size = 10, face = "bold"),      
+    axis.text.x = element_text(size = 8, angle = 20, hjust = 1), 
+    axis.text.y = element_text(size = 8),                     
+    legend.text = element_text(size = 10),                     
+    legend.title = element_text(size = 12)  
+  ) +
+  scale_fill_brewer(palette = "Dark2")
+
+#Drop high VIF variables that were strongly correlated with something else
+drop_vars <- c("infant.deaths", "thinness..1.19.years", "GDP")
+data <- data %>% dplyr::select(-all_of(drop_vars))
+
+#Findings: There is a strong correlation [> 0.8] between infant.deaths and under.fivedeaths; GDP and percentage.expenditure; thinneness.1.19.years and thinnness.5.9.years
+#We need to avoid multicollinearity issues, so we need to drop one of each pair
+#We decided to drop infant.deaths because under.fivedeaths incorporates infant.deaths plus more (Correlation = 1)
+#We decided to drop thinness.1.19 years and GDP because of VIF
+#As for income.composition.of.resources and schooling that had relatively high correlation (0.8), we're going to keep them because VIF doesn't suggest otherwise
+```
+
+7. TWO SAMPLE T-TEST
+```{r }
+#BOXPLOT OF DEVELOPED AND DEVELOPING COUNTRIES' LIFE EXPECTANCIES
+set_plot_dimensions(10, 6)
+ggplot(data, aes(x = Status, y = Life.expectancy, fill = Status)) +
+  geom_boxplot() +
+  labs(title = "Life Expectancy by Country Status", 
+       x = "Status", 
+       y = "Life Expectancy")
+
+#TWO SAMPLE T-TEST (DEVELOPED AND DEVELOPING)
+#H0: The average life expectancy is the same for developing and developed countries.
+#Ha: The average life expectancy differs.
+#Findings: Since p-value < 0.05, 95% confidence interval does not include 0, we can conclude that, on average, developed countries have significantly higher life expectancy than developing countries
+
+t_test_result <- t.test(Life.expectancy ~ Status, data = data)
+print(t_test_result)
+
+#Findings: life expectancy in Developed Countries is higher which means that this categorical variable might be a good predictor for the model
+```
+
+8. MULTIPLE LINEAR REGRESSION MODELS
+```{r }
+# Define variable groups for modeling
+health_vars <- c("Adult.Mortality", "Alcohol", "Hepatitis.B", "Measles", "BMI", "under.five.deaths", "Polio", "Diphtheria", "HIV.AIDS", "thinness.5.9.years")
+econ_vars <- c("percentage.expenditure", "Total.expenditure", "Income.composition.of.resources")
+social_vars <- c("Status", "Schooling")
+
+# Model 1: Life Expectancy ~ Health Indicators
+# Hypothesis: Higher mortality and disease burdens (like Adult Mortality, HIV.AIDS, Hepatitis.B) are associated with lower life expectancy.
+formula_health <- as.formula(paste("Life.expectancy ~", paste(health_vars, collapse = " + ")))
+model1 <- lm(formula_health, data = data)
+summary(model1)
+
+# Model 2: Life Expectancy ~ Economic Indicators
+# Hypothesis: Better economic conditions ( Income.composition.of.resources, percentage.expenditure) are associated with higher life expectancy.
+formula_econ <- as.formula(paste("Life.expectancy ~", paste(econ_vars, collapse = " + ")))
+model2 <- lm(formula_econ, data = data)
+summary(model2)
+
+# Model 3: Life Expectancy ~ Social Indicators
+# Hypothesis: Higher education levels (measured by Schooling) + Status are associated with higher life expectancy.
+formula_social <- as.formula(paste("Life.expectancy ~", paste(social_vars, collapse = " + ")))
+model3 <- lm(formula_social, data = data)
+summary(model3)
+# Model 4: Combined Model: Life Expectancy ~ Health + Economic + Social Indicators
+# Hypothesis: A model integrating health, economic, and social variables provides the best overall prediction.
+all_vars <- c(health_vars, econ_vars, social_vars)
+formula_combined <- as.formula(paste("Life.expectancy ~", paste(all_vars, collapse = " + ")))
+model4 <- lm(formula_combined, data = data)
+summary(model4)
+
+#Findings: 
+# - Model 1 included only health-related predictors like adult mortality, HIV/AIDS, hepatitis B, measles, BMI, and others. Most variables in this model were statistically significant with p-values less than 0.05. The adjusted R-squared was about 72.84%, meaning health factors alone explain around 72.84% of the variation in life expectancy.
+# 
+# - Model 2 included economic indicators like percentage health expenditure, total expenditure, and income composition of resources. All variables were highly significant, and the adjusted R-squared was about 50.37%. This suggests that while economic factors are important, they explain less of the variation in life expectancy compared to health factors.
+# 
+# - Model 3 focused on social indicators, specifically schooling and country status. Both variables were highly significant, and the adjusted R-squared was about 53.24%, indicating social factors also play a meaningful role in life expectancy.
+# 
+# - Model 4 combined health, economic, and social variables together. This model produced the highest adjusted R-squared of about 81.01%, showing that combining health, economic, and social factors provides the strongest predictive power for life expectancy. However, not all variables in this combined model were statistically significant. For example, alcohol consumption, thinness, and total expenditure had p-values greater than 0.05.
+
+```
+9. DROPPING INSIGNIFICANT VARIABLES FROM MODEL 4
+```{r }
+#Dropping not signficiant variables
+all_vars <- c(health_vars, econ_vars, social_vars)
+all_vars <- setdiff(all_vars, c("Alcohol", "thinness.5.9.years", "Total.expenditure"))
+
+formula_combined <- as.formula(paste("Life.expectancy ~", paste(all_vars, collapse = " + ")))
+model4_refined <- lm(formula_combined, data = data)
+summary(model4_refined)
+```
+
+10. ANOVA + CONFIDENCE INTERVALS (REFER TO #13 AGAIN FOR UPDATED SE, CI, ETC)
+```{r}
+#ANOVA (Compare model fit)
+anova(model4_refined)
+
+#Confidence Intervals for coefficients
+confint(model4_refined)
+
+#Findings:
+#ANOVA confirms that almost all variables in our final model are statistically significant contributors to explaining life expectancy.
+
+#Confidence intervals provide a range of plausible values for each coefficient. 
+#For example, the CI for Adult Mortality (around -0.022 to -0.019) suggests that for each increase in mortality, life expectancy decreases by roughly 0.02 years, holding other factors constant.
+
+```
+
+
+
+11. COMPARING MODELS USING AIC, BIC, ADJUSTED R_SQUARED
+```{r}
+models_list <- list(model1, model2, model3, model4_refined)
+model_names <- c("Health Indicators", "Economic Indicators", "Social Indicators", "Combined Model")
+
+aic_values <- sapply(models_list, AIC)
+bic_values <- sapply(models_list, BIC)
+
+model_comparison <- data.frame(
+  Model = model_names,
+  AIC = aic_values,
+  BIC = bic_values,
+  Adj_R_squared = sapply(models_list, function(m) summary(m)$adj.r.squared)
+)
+
+# Print model comparison
+print(model_comparison)
+
+```
+
+12. REGULARIZATION TECHNIQUES (RIDGE, LASSO)
+```{r}
+# Preparing data for regularization
+x <- model.matrix(Life.expectancy ~ ., data = data)[,-1]  # Remove intercept
+y <- data$Life.expectancy
+
+# Ridge Regression
+set.seed(2025)
+ridge_cv <- cv.glmnet(x, y, alpha = 0, nfolds = 10)
+ridge_best_lambda <- ridge_cv$lambda.min
+ridge_model <- glmnet(x, y, alpha = 0, lambda = ridge_best_lambda)
+
+# LASSO Regression
+set.seed(2025)
+lasso_cv <- cv.glmnet(x, y, alpha = 1, nfolds = 10)
+lasso_best_lambda <- lasso_cv$lambda.min
+lasso_model <- glmnet(x, y, alpha = 1, lambda = lasso_best_lambda)
+
+# Plot lambda selection
+par(mfrow = c(1, 3))
+plot(ridge_cv, main = "Ridge: Lambda Selection")
+plot(lasso_cv, main = "LASSO: Lambda Selection")
+
+# Plot coefficient paths
+par(mfrow = c(1, 3))
+plot(glmnet(x, y, alpha = 0), main = "Ridge: Coefficient Path")
+plot(glmnet(x, y, alpha = 1), main = "LASSO: Coefficient Path")
+
+# Get coefficients from all models
+coef_ridge <- as.matrix(coef(ridge_model))
+coef_lasso <- as.matrix(coef(lasso_model))
+coef_ols <- coef(model4)
+
+# Create a vector with all possible variable names
+all_vars <- unique(c(names(coef_ols), rownames(coef_ridge)))
+
+# Function to get coefficient value or 0 if not present
+get_coef <- function(coef_vec, var_name) {
+  if(var_name %in% names(coef_vec)) {
+    return(coef_vec[var_name])
+  } else {
+    return(0)
+  }
+}
+
+# Create data frame with all variables and their coefficients from each model
+coef_comparison <- data.frame(
+  Variable = all_vars,
+  OLS = sapply(all_vars, function(v) get_coef(coef_ols, v)),
+  Ridge = sapply(all_vars, function(v) {
+    if(v %in% rownames(coef_ridge)) coef_ridge[v,1] else 0
+  }),
+  LASSO = sapply(all_vars, function(v) {
+    if(v %in% rownames(coef_lasso)) coef_lasso[v,1] else 0
+  })
+)
+
+# Calculate model performance
+predictions <- list(
+  OLS = predict(model4),
+  Ridge = predict(ridge_model, newx = x),
+  LASSO = predict(lasso_model, newx = x)
+)
+
+rmse_values <- sapply(predictions, function(pred) rmse(y, pred))
+r2_values <- sapply(predictions, function(pred) {
+  1 - sum((y - pred)^2) / sum((y - mean(y))^2)
+})
+
+performance_df <- data.frame(
+  Model = names(predictions),
+  RMSE = rmse_values,
+  R_squared = r2_values
+)
+
+print(performance_df)
+#Findings: The very similar RMSE and R_squared values indicate that all three methods are capturing the underlying relationships almost equally well. The slight differences (on the order of 0.005 or less for RMSE and a few thousandths for R_squared) are not statistically or practically significant.
+#  In cases where the model is already stable, the effect of regularization on overall predictive performance can be minimal—as is the case here. 
+#We might prefer the simpler OLS model for its interpretability
+```
+
+
+13. RESDIUAL CHECKS & MODEL DIAGNOSTICS
+```{r }
+#Findings:
+#Residual vs Fitted - Our model appears to fit the bulk of the data really well, but there is a slight non-linearity and (funnel shape?) at higher fitted values  and outliers (suggests mild heteroscedasticity) these are natural given the international life expectancy data
+#QQ Plot - we expect that the points are roughly following along the straight line, which is correct in this case (except for deviations at the ends, which is common), which confirms the residuals are rougly normally distributed with skewness/heavy tails.
+
+plot(model4, which = 1)
+plot(model4, which = 2)
+
+# Histogram of Residuals (To check normality visually)
+#Findings: the resdiuals looks fairly symmetric, but slightly skewed
+hist(residuals(model4), breaks = 30, col = "lightblue", 
+     main = "Histogram of Residuals", xlab = "Residuals")
+
+# Residuals vs Each Predictor 
+#Most residual plots show randomness around 0, which is good.
+#Some minor patterns with percentage.expendtiure + HIV.AIDS
+predictors <- names(model4$model)[-1] 
+plot_list <- lapply(predictors, function(var) {
+  ggplot(data.frame(residuals = residuals(model4), predictor = data[[var]]),aes(x = predictor, y = residuals)) +
+    geom_point(color = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = paste("Residuals vs", var), x = var, y = "Residuals") +
+    theme_minimal()
+})
+
+marrangeGrob(plot_list, nrow = 2, ncol = 2)
+
+# Breusch-Pagan Test (Check for heteroscedasticity) - Strong evidence of heteroscedasticity, which means that standard errors could be wrong -> p-values could be misleading (Model can predict well, but inference (like p-values & CI's) may not be valid unless fixed; which is why we used coeftest to reinterpret the values)
+bptest(model4)
+print(coeftest(model4, vcov = vcovHC(model4, type = "HC1")))
+#New Findings: After applying robust standard errors to account for heteroscedasticity, nearly all variables in our final model remained statistically significant. 
+#Key health factors like Adult Mortality, HIV/AIDS, and Hepatitis B were negatively associated with life expectancy. Economic (percentage expenditure, income resources) and social factors (schooling, country status) were positively associated.
+
+Measles had a higher p-value (~0.013) but was still significant at 0.05. These results suggest our model reliably captures the main drivers of life expectancy across health, economic, and social domains.
+
+
+# Shapiro-Wilk Test (Test for normality of residuals) - Residuals not perfectly normal. Due to large sample size, this is common and not critical; With large n, Central Limit Thereom helps, so not a huge problem
+shapiro.test(residuals(model4))
+
+# Durbin-Watson Test (Check for autocorrelation in residuals (are errors indepdent?)) - Evidence of positive autocorrelation in residuals. This happens when observations are ordered by time or location. Ours is cross-sectional (country-level data without inherent ordering), so this result may not indicate a severe issue. However, it is worth noting as a potential limitation.
+dwtest(model4)
+
+#VIF (multicollinearity) - All < 5; so no concern here
+vif(model4)
+```
+
+14. FINAL MODEL PERFORMANCE METRICS
+```{r }
+#Model Performance Metrics (RMSE & R-squared)
+rmse(actual = data$Life.expectancy, predicted = predict(model4))
+# R-squared - 0.8104
+
+# Findings: Approximately 81.04% of the variation in transformed life expectancy can be explained 
+# by the selected predictors in the model. The RMSE is 4.139904 
+# indicating that on average, the model's predictions deviate from the actual transformed values 
+# by about 4.139904 units. 
+#These reuslts reflect a relatively strong model fit given the complexity of global health data
+```
+
+
+
+
+
+
